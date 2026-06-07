@@ -201,6 +201,7 @@ pub(crate) struct TunnelConnectionInput {
     pub noise_state: TunnelNoiseState,
     pub cbor_tx_recv: mpsc::Receiver<CborRequest>,
     pub cbor_rx_send: mpsc::Sender<CborResponse>,
+    pub close_rx: mpsc::Receiver<()>,
 }
 
 impl TunnelConnectionInput {
@@ -209,6 +210,7 @@ impl TunnelConnectionInput {
         known_device_store: Option<Arc<dyn CableKnownDeviceInfoStore>>,
         cbor_tx_recv: mpsc::Receiver<CborRequest>,
         cbor_rx_send: mpsc::Sender<CborResponse>,
+        close_rx: mpsc::Receiver<()>,
     ) -> Self {
         Self {
             connection_type: handshake_output.connection_type,
@@ -218,6 +220,7 @@ impl TunnelConnectionInput {
             noise_state: handshake_output.noise_state,
             cbor_tx_recv,
             cbor_rx_send,
+            close_rx,
         }
     }
 }

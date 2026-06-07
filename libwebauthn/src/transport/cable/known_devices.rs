@@ -201,6 +201,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
         let (ux_update_sender, _) = broadcast::channel(16);
         let (cbor_tx_send, cbor_tx_recv) = mpsc::channel(16);
         let (cbor_rx_send, cbor_rx_recv) = mpsc::channel(16);
+        let (close_sender, close_rx) = mpsc::channel(1);
         let (connection_state_sender, connection_state_receiver) =
             watch::channel(ConnectionState::Connecting);
 
@@ -224,6 +225,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
                 Some(known_device.store),
                 cbor_tx_recv,
                 cbor_rx_send,
+                close_rx,
             );
 
             match protocol::connection(tunnel_input).await {
@@ -246,6 +248,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
             ux_update_sender,
             connection_state_receiver,
             persistent_token_store: settings.persistent_token_store,
+            close_sender: Some(close_sender),
         })
     }
 }

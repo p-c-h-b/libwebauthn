@@ -330,6 +330,15 @@ pub(crate) async fn connection(mut input: TunnelConnectionInput) -> Result<(), C
                     }
                 }
             }
+            _ = input.close_rx.recv() => {
+                debug!("Channel close requested, sending Shutdown control frame");
+                if let Err(e) =
+                    connection_send_shutdown(&mut *input.data_channel, &mut input.noise_state).await
+                {
+                    warn!(?e, "Failed to send Shutdown control frame on close");
+                }
+                return Ok(());
+            }
             Some(request) = input.cbor_tx_recv.recv() => {
                 match request.command {
                     // Optimisation: respond to GetInfo requests immediately with the cached response
@@ -378,16 +387,47 @@ async fn connection_send(
     }
     trace!(?cbor_request, cbor_request_len = cbor_request.len());
 
-    let extra_bytes = PADDING_GRANULARITY - (cbor_request.len() % PADDING_GRANULARITY);
-    let padded_len = cbor_request.len() + extra_bytes;
+    send_tunnel_frame(
+        CableTunnelMessageType::Ctap,
+        &cbor_request,
+        data_channel,
+        noise_state,
+    )
+    .await
+}
 
-    let mut padded_cbor_request = cbor_request.clone();
-    padded_cbor_request.resize(padded_len, 0u8);
-    if let Some(last) = padded_cbor_request.last_mut() {
+/// Sends an empty `Shutdown` control frame over the encrypted channel.
+async fn connection_send_shutdown(
+    data_channel: &mut dyn CableDataChannel,
+    noise_state: &mut TunnelNoiseState,
+) -> Result<(), CableError> {
+    debug!("Sending Shutdown control frame");
+    send_tunnel_frame(
+        CableTunnelMessageType::Shutdown,
+        &[],
+        data_channel,
+        noise_state,
+    )
+    .await
+}
+
+/// Pads `payload`, wraps it in a `CableTunnelMessage`, encrypts it, and sends it.
+async fn send_tunnel_frame(
+    message_type: CableTunnelMessageType,
+    payload: &[u8],
+    data_channel: &mut dyn CableDataChannel,
+    noise_state: &mut TunnelNoiseState,
+) -> Result<(), CableError> {
+    let extra_bytes = PADDING_GRANULARITY - (payload.len() % PADDING_GRANULARITY);
+    let padded_len = payload.len() + extra_bytes;
+
+    let mut padded_payload = payload.to_vec();
+    padded_payload.resize(padded_len, 0u8);
+    if let Some(last) = padded_payload.last_mut() {
         *last = (extra_bytes - 1) as u8;
     }
 
-    let frame = CableTunnelMessage::new(CableTunnelMessageType::Ctap, &padded_cbor_request);
+    let frame = CableTunnelMessage::new(message_type, &padded_payload);
     let frame_serialized = frame.to_vec();
     trace!(?frame_serialized);
 
@@ -793,5 +833,150 @@ mod tests {
         let frame = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 0x03];
         let stripped = strip_frame_padding(frame).unwrap();
         assert_eq!(stripped, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    use serde_indexed::SerializeIndexed;
+    use tokio::sync::mpsc;
+
+    /// In-memory data channel: records outbound frames and replays queued inbound ones.
+    struct TestDataChannel {
+        inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+        outbound: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl CableDataChannel for TestDataChannel {
+        async fn send(&mut self, message: &[u8]) -> Result<(), CableError> {
+            let _ = self.outbound.send(message.to_vec());
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>, CableError> {
+            Ok(self.inbound.recv().await)
+        }
+    }
+
+    /// Two Noise transport states that can encrypt/decrypt to each other.
+    fn paired_transport_states() -> (TransportState, TransportState) {
+        let mut initiator = Builder::new("Noise_NN_P256_AESGCM_SHA256".parse().unwrap())
+            .build_initiator()
+            .unwrap();
+        let mut responder = Builder::new("Noise_NN_P256_AESGCM_SHA256".parse().unwrap())
+            .build_responder()
+            .unwrap();
+        let mut a = [0u8; 1024];
+        let mut b = [0u8; 1024];
+        let n = initiator.write_message(&[], &mut a).unwrap();
+        responder.read_message(&a[..n], &mut b).unwrap();
+        let n = responder.write_message(&[], &mut a).unwrap();
+        initiator.read_message(&a[..n], &mut b).unwrap();
+        (
+            initiator.into_transport_mode().unwrap(),
+            responder.into_transport_mode().unwrap(),
+        )
+    }
+
+    fn pad(mut payload: Vec<u8>) -> Vec<u8> {
+        let extra = PADDING_GRANULARITY - (payload.len() % PADDING_GRANULARITY);
+        let new_len = payload.len() + extra;
+        payload.resize(new_len, 0u8);
+        *payload.last_mut().unwrap() = (extra - 1) as u8;
+        payload
+    }
+
+    fn encrypt(state: &mut TransportState, plaintext: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; plaintext.len() + 64];
+        let n = state.write_message(plaintext, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    fn decrypt(state: &mut TransportState, ciphertext: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; ciphertext.len() + 64];
+        let n = state.read_message(ciphertext, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    #[derive(SerializeIndexed)]
+    struct TestInitialMessage {
+        #[serde(index = 0x01)]
+        info: ByteBuf,
+    }
+
+    /// Encrypted initial post-handshake message carrying a minimal GetInfo.
+    fn encrypted_initial_message(responder: &mut TransportState) -> Vec<u8> {
+        let get_info = Ctap2GetInfoResponse {
+            versions: vec!["FIDO_2_0".to_string()],
+            aaguid: ByteBuf::from(vec![0u8; 16]),
+            ..Default::default()
+        };
+        let initial = TestInitialMessage {
+            info: ByteBuf::from(cbor::to_vec(&get_info).unwrap()),
+        };
+        encrypt(responder, &pad(cbor::to_vec(&initial).unwrap()))
+    }
+
+    fn qr_connection_type() -> CableTunnelConnectionType {
+        CableTunnelConnectionType::QrCode {
+            routing_id: "000000".to_string(),
+            tunnel_id: "00000000000000000000000000000000".to_string(),
+            private_key: NonZeroScalar::random(&mut OsRng),
+        }
+    }
+
+    /// Decrypts an outbound frame and returns its tunnel message type byte.
+    fn outbound_message_type(frame: &[u8], responder: &mut TransportState) -> u8 {
+        let stripped = strip_frame_padding(decrypt(responder, frame)).unwrap();
+        *stripped.first().unwrap()
+    }
+
+    #[tokio::test]
+    async fn connection_sends_shutdown_on_close() {
+        let (initiator, mut responder) = paired_transport_states();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        inbound_tx
+            .send(encrypted_initial_message(&mut responder))
+            .unwrap();
+
+        let (cbor_tx_send, cbor_tx_recv) = mpsc::channel::<CborRequest>(4);
+        let (cbor_rx_send, cbor_rx_recv) = mpsc::channel::<CborResponse>(4);
+        let (close_tx, close_rx) = mpsc::channel::<()>(1);
+
+        let input = TunnelConnectionInput {
+            connection_type: qr_connection_type(),
+            tunnel_domain: "cable.example.com".to_string(),
+            known_device_store: None,
+            data_channel: Box::new(TestDataChannel {
+                inbound: inbound_rx,
+                outbound: outbound_tx,
+            }),
+            noise_state: TunnelNoiseState {
+                transport_state: initiator,
+                handshake_hash: vec![0u8; 32],
+            },
+            cbor_tx_recv,
+            cbor_rx_send,
+            close_rx,
+        };
+
+        let handle = tokio::spawn(connection(input));
+
+        close_tx.send(()).await.unwrap();
+
+        let frame = outbound_rx
+            .recv()
+            .await
+            .expect("a frame on the outbound path");
+        assert_eq!(
+            outbound_message_type(&frame, &mut responder),
+            CableTunnelMessageType::Shutdown as u8
+        );
+        assert!(handle.await.unwrap().is_ok());
+
+        // Keep the channel ends alive until the loop has shut down.
+        drop((inbound_tx, cbor_tx_send, cbor_rx_recv, close_tx));
     }
 }
