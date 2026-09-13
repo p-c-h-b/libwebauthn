@@ -96,5 +96,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         .expect("Failed to serialize MakeCredential response");
     println!("WebAuthn MakeCredential response (JSON):\n{response_json}");
 
+    // A transient QR code never lingers, so this is a plain graceful close.
+    channel.close().await;
     Ok(())
 }
