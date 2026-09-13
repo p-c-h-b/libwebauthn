@@ -2,6 +2,7 @@
 //! hybrid transport. Runs over any [`CableDataChannel`].
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use p256::{ecdh, NonZeroScalar};
@@ -20,13 +21,19 @@ use super::known_devices::ClientPayload;
 use super::known_devices::{CableKnownDeviceInfo, CableKnownDeviceInfoStore};
 use crate::proto::ctap2::cbor::{self, CborRequest, CborResponse, Value};
 use crate::proto::ctap2::{Ctap2CommandCode, Ctap2GetInfoResponse};
-use crate::transport::cable::connection_stages::TunnelConnectionInput;
+use crate::transport::cable::connection_stages::{
+    next_teardown, TunnelConnectionInput, UxUpdateSender,
+};
 use crate::transport::cable::error::CableError;
 use crate::transport::cable::known_devices::CableKnownDeviceId;
+use crate::transport::cable::linger::Teardown;
 
 const P256_X962_LENGTH: usize = 65;
 const MAX_CBOR_SIZE: usize = 1024 * 1024;
 const PADDING_GRANULARITY: usize = 32;
+
+/// Bounds every outbound send, so a dead socket cannot stall teardown.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 const CABLE_PROLOGUE_STATE_ASSISTED: &[u8] = &[0u8];
 const CABLE_PROLOGUE_QR_INITIATED: &[u8] = &[1u8];
@@ -277,28 +284,61 @@ pub(crate) async fn do_handshake(
 
 /// Returns `Ok(())` on a clean close and `Err(_)` on any fault that leaves
 /// the encrypted channel unusable; callers surface `Err(_)` via `send_error`.
-pub(crate) async fn connection(mut input: TunnelConnectionInput) -> Result<(), CableError> {
-    let get_info_response_serialized: Vec<u8> = match input.data_channel.recv().await {
-        Ok(Some(message)) => match connection_recv_initial(message, &mut input.noise_state).await {
-            Ok(initial) => initial,
-            Err(e) => {
-                error!(?e, "Failed to process initial message");
-                return Err(e);
-            }
-        },
-        Ok(None) => {
-            error!("Connection closed before initial message was received");
-            return Err(CableError::ConnectionLost);
-        }
-        Err(e) => {
-            error!(?e, "Failed to read initial message");
-            return Err(e);
+pub(crate) async fn connection(
+    mut input: TunnelConnectionInput,
+    _ux_sender: &dyn UxUpdateSender,
+) -> Result<(), CableError> {
+    // The secure channel exists, so a graceful teardown before the initial
+    // message still gets a courtesy Shutdown.
+    let get_info_response_serialized: Vec<u8> = loop {
+        tokio::select! {
+            biased;
+            intent = next_teardown(&mut input.teardown_rx) => match intent {
+                Teardown::Close => {
+                    send_shutdown_bounded(&mut *input.data_channel, &mut input.noise_state).await;
+                    return Ok(());
+                }
+                Teardown::Cancel => return Ok(()),
+                Teardown::Active => continue,
+            },
+            result = input.data_channel.recv() => match result {
+                Ok(Some(message)) => {
+                    match connection_recv_initial(message, &mut input.noise_state).await {
+                        Ok(initial) => break initial,
+                        Err(e) => {
+                            error!(?e, "Failed to process initial message");
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    error!("Connection closed before initial message was received");
+                    return Err(CableError::ConnectionLost);
+                }
+                Err(e) => {
+                    error!(?e, "Failed to read initial message");
+                    return Err(e);
+                }
+            },
         }
     };
     debug!(?get_info_response_serialized, "Received initial message");
 
     loop {
         tokio::select! {
+            biased;
+            intent = next_teardown(&mut input.teardown_rx) => match intent {
+                Teardown::Close => {
+                    debug!("Channel close requested, sending Shutdown control frame");
+                    send_shutdown_bounded(&mut *input.data_channel, &mut input.noise_state).await;
+                    return Ok(());
+                }
+                Teardown::Cancel => {
+                    debug!("Channel cancelled, dropping the connection");
+                    return Ok(());
+                }
+                Teardown::Active => {}
+            },
             result = input.data_channel.recv() => {
                 match result {
                     Ok(Some(message)) => {
@@ -332,15 +372,6 @@ pub(crate) async fn connection(mut input: TunnelConnectionInput) -> Result<(), C
                     }
                 }
             }
-            _ = input.close_rx.recv() => {
-                debug!("Channel close requested, sending Shutdown control frame");
-                if let Err(e) =
-                    connection_send_shutdown(&mut *input.data_channel, &mut input.noise_state).await
-                {
-                    warn!(?e, "Failed to send Shutdown control frame on close");
-                }
-                return Ok(());
-            }
             Some(request) = input.cbor_tx_recv.recv() => {
                 match request.command {
                     // Optimisation: respond to GetInfo requests immediately with the cached response
@@ -354,20 +385,40 @@ pub(crate) async fn connection(mut input: TunnelConnectionInput) -> Result<(), C
                     }
                     _ => {
                         debug!(?request.command, "Sending CBOR request");
-                        if let Err(e) = connection_send(
+                        let send = connection_send(
                             request,
                             &mut *input.data_channel,
                             &mut input.noise_state,
-                        )
-                        .await
-                        {
-                            error!(?e, "Fatal error sending CBOR request");
-                            return Err(e);
+                        );
+                        match tokio::time::timeout(SEND_TIMEOUT, send).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                error!(?e, "Fatal error sending CBOR request");
+                                return Err(e);
+                            }
+                            Err(_) => {
+                                error!("Timed out sending CBOR request");
+                                return Err(CableError::Timeout);
+                            }
                         }
                     }
                 }
             }
         };
+    }
+}
+
+/// Best-effort Shutdown on a graceful teardown. A failure or timeout is
+/// logged and otherwise ignored, since the connection is going away anyway.
+async fn send_shutdown_bounded(
+    data_channel: &mut dyn CableDataChannel,
+    noise_state: &mut TunnelNoiseState,
+) {
+    let send = connection_send_shutdown(data_channel, noise_state);
+    match tokio::time::timeout(SEND_TIMEOUT, send).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(?e, "Failed to send Shutdown control frame"),
+        Err(_) => warn!("Timed out sending Shutdown control frame"),
     }
 }
 
@@ -869,7 +920,9 @@ mod tests {
     }
 
     use serde_indexed::SerializeIndexed;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
+
+    use crate::transport::cable::channel::{CableUxUpdate, ConnectionState};
 
     /// In-memory data channel: records outbound frames and replays queued inbound ones.
     struct TestDataChannel {
@@ -886,6 +939,22 @@ mod tests {
 
         async fn recv(&mut self) -> Result<Option<Vec<u8>>, CableError> {
             Ok(self.inbound.recv().await)
+        }
+    }
+
+    /// Publishes connection states on a watch so tests can observe phases.
+    struct TestUxSender {
+        state_tx: watch::Sender<ConnectionState>,
+    }
+
+    #[async_trait]
+    impl UxUpdateSender for TestUxSender {
+        async fn send_update(&self, _update: CableUxUpdate) {}
+        async fn send_error(&self, _error: CableError) {
+            let _ = self.state_tx.send(ConnectionState::Terminated);
+        }
+        async fn set_connection_state(&self, state: ConnectionState) {
+            let _ = self.state_tx.send(state);
         }
     }
 
@@ -964,96 +1033,199 @@ mod tests {
         *stripped.first().unwrap()
     }
 
+    /// The peer side of a post-handshake connection plus every caller-side handle.
+    struct Harness {
+        responder: TransportState,
+        inbound_tx: mpsc::UnboundedSender<Vec<u8>>,
+        outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        cbor_tx_send: mpsc::Sender<CborRequest>,
+        cbor_rx_recv: mpsc::Receiver<CborResponse>,
+        teardown_tx: watch::Sender<Teardown>,
+        input: Option<TunnelConnectionInput>,
+        ux_sender: Option<TestUxSender>,
+    }
+
+    impl Harness {
+        fn new(connection_type: CableTunnelConnectionType) -> Self {
+            let (initiator, responder) = paired_transport_states();
+            let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (cbor_tx_send, cbor_tx_recv) = mpsc::channel::<CborRequest>(4);
+            let (cbor_rx_send, cbor_rx_recv) = mpsc::channel::<CborResponse>(4);
+            let (teardown_tx, teardown_rx) = watch::channel(Teardown::Active);
+            let (state_tx, _state_rx) = watch::channel(ConnectionState::Connected);
+            let input = TunnelConnectionInput {
+                connection_type,
+                tunnel_domain: "cable.example.com".to_string(),
+                known_device_store: None,
+                data_channel: Box::new(TestDataChannel {
+                    inbound: inbound_rx,
+                    outbound: outbound_tx,
+                }),
+                noise_state: TunnelNoiseState {
+                    transport_state: initiator,
+                    handshake_hash: vec![0u8; 32],
+                },
+                cbor_tx_recv,
+                cbor_rx_send,
+                teardown_rx,
+            };
+            Self {
+                responder,
+                inbound_tx,
+                outbound_rx,
+                cbor_tx_send,
+                cbor_rx_recv,
+                teardown_tx,
+                input: Some(input),
+                ux_sender: Some(TestUxSender { state_tx }),
+            }
+        }
+
+        fn qr() -> Self {
+            Self::new(qr_connection_type())
+        }
+
+        /// Queues the peer's initial message, as sent right after the handshake.
+        fn send_initial_message(&mut self) {
+            let frame = encrypted_initial_message(&mut self.responder);
+            self.inbound_tx.send(frame).unwrap();
+        }
+
+        fn send_peer_frame(&mut self, plaintext: Vec<u8>) {
+            let frame = encrypt(&mut self.responder, &pad(plaintext));
+            self.inbound_tx.send(frame).unwrap();
+        }
+
+        /// Runs the connection loop on its own task.
+        fn spawn(&mut self) -> tokio::task::JoinHandle<Result<(), CableError>> {
+            let input = self.input.take().expect("spawned once");
+            let ux_sender = self.ux_sender.take().expect("spawned once");
+            tokio::spawn(async move { connection(input, &ux_sender).await })
+        }
+
+        fn teardown(&self, intent: Teardown) {
+            self.teardown_tx.send_replace(intent);
+        }
+
+        async fn next_outbound_type(&mut self) -> u8 {
+            let frame = self.outbound_rx.recv().await.expect("an outbound frame");
+            outbound_message_type(&frame, &mut self.responder)
+        }
+    }
+
     #[tokio::test]
     async fn connection_sends_shutdown_on_close() {
-        let (initiator, mut responder) = paired_transport_states();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut h = Harness::qr();
+        h.send_initial_message();
+        let handle = h.spawn();
 
-        inbound_tx
-            .send(encrypted_initial_message(&mut responder))
-            .unwrap();
+        h.teardown(Teardown::Close);
 
-        let (cbor_tx_send, cbor_tx_recv) = mpsc::channel::<CborRequest>(4);
-        let (cbor_rx_send, cbor_rx_recv) = mpsc::channel::<CborResponse>(4);
-        let (close_tx, close_rx) = mpsc::channel::<()>(1);
-
-        let input = TunnelConnectionInput {
-            connection_type: qr_connection_type(),
-            tunnel_domain: "cable.example.com".to_string(),
-            known_device_store: None,
-            data_channel: Box::new(TestDataChannel {
-                inbound: inbound_rx,
-                outbound: outbound_tx,
-            }),
-            noise_state: TunnelNoiseState {
-                transport_state: initiator,
-                handshake_hash: vec![0u8; 32],
-            },
-            cbor_tx_recv,
-            cbor_rx_send,
-            close_rx,
-        };
-
-        let handle = tokio::spawn(connection(input));
-
-        close_tx.send(()).await.unwrap();
-
-        let frame = outbound_rx
-            .recv()
-            .await
-            .expect("a frame on the outbound path");
         assert_eq!(
-            outbound_message_type(&frame, &mut responder),
+            h.next_outbound_type().await,
             CableTunnelMessageType::Shutdown as u8
         );
         assert!(handle.await.unwrap().is_ok());
+        assert!(h.outbound_rx.try_recv().is_err(), "exactly one Shutdown");
+    }
 
-        // Keep the channel ends alive until the loop has shut down.
-        drop((inbound_tx, cbor_tx_send, cbor_rx_recv, close_tx));
+    #[tokio::test]
+    async fn cancel_sends_nothing() {
+        let mut h = Harness::qr();
+        h.send_initial_message();
+        let handle = h.spawn();
+
+        // Let the loop consume the initial message before cancelling.
+        h.cbor_tx_send
+            .send(CborRequest::new(Ctap2CommandCode::AuthenticatorGetInfo))
+            .await
+            .unwrap();
+        h.cbor_rx_recv
+            .recv()
+            .await
+            .expect("cached GetInfo response");
+
+        h.teardown(Teardown::Cancel);
+
+        assert!(handle.await.unwrap().is_ok());
+        assert!(h.outbound_rx.try_recv().is_err(), "no Shutdown on cancel");
+    }
+
+    #[tokio::test]
+    async fn close_before_initial_message_sends_shutdown() {
+        let mut h = Harness::qr();
+        let handle = h.spawn();
+
+        // The peer never sends its initial message; the loop must still
+        // honour the close promptly and say goodbye.
+        h.teardown(Teardown::Close);
+
+        assert_eq!(
+            h.next_outbound_type().await,
+            CableTunnelMessageType::Shutdown as u8
+        );
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_before_initial_message_terminates_silently() {
+        let mut h = Harness::qr();
+        let handle = h.spawn();
+
+        h.teardown(Teardown::Cancel);
+
+        assert!(handle.await.unwrap().is_ok());
+        assert!(h.outbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn every_sender_gone_counts_as_cancel() {
+        let mut h = Harness::qr();
+        h.send_initial_message();
+        let handle = h.spawn();
+
+        drop(h.teardown_tx);
+
+        assert!(handle.await.unwrap().is_ok());
+        assert!(h.outbound_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn peer_shutdown_ends_connection_cleanly() {
-        let (initiator, mut responder) = paired_transport_states();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        inbound_tx
-            .send(encrypted_initial_message(&mut responder))
-            .unwrap();
+        let mut h = Harness::qr();
+        h.send_initial_message();
         // A type-only Shutdown frame from the peer, padded like any other frame.
-        inbound_tx
-            .send(encrypt(
-                &mut responder,
-                &pad(vec![CableTunnelMessageType::Shutdown as u8]),
-            ))
+        h.send_peer_frame(vec![CableTunnelMessageType::Shutdown as u8]);
+        let handle = h.spawn();
+
+        assert!(handle.await.unwrap().is_ok());
+        assert!(
+            h.outbound_rx.try_recv().is_err(),
+            "no frame is sent in reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctap_request_is_forwarded_and_response_delivered() {
+        let mut h = Harness::qr();
+        h.send_initial_message();
+        let handle = h.spawn();
+
+        h.cbor_tx_send
+            .send(CborRequest::new(Ctap2CommandCode::AuthenticatorClientPin))
+            .await
             .unwrap();
+        assert_eq!(
+            h.next_outbound_type().await,
+            CableTunnelMessageType::Ctap as u8
+        );
 
-        let (cbor_tx_send, cbor_tx_recv) = mpsc::channel::<CborRequest>(4);
-        let (cbor_rx_send, cbor_rx_recv) = mpsc::channel::<CborResponse>(4);
-        let (close_tx, close_rx) = mpsc::channel::<()>(1);
+        // A CTAP response frame: [Ctap type byte][CTAP status OK].
+        h.send_peer_frame(vec![CableTunnelMessageType::Ctap as u8, 0x00]);
+        h.cbor_rx_recv.recv().await.expect("a CTAP response");
 
-        let input = TunnelConnectionInput {
-            connection_type: qr_connection_type(),
-            tunnel_domain: "cable.example.com".to_string(),
-            known_device_store: None,
-            data_channel: Box::new(TestDataChannel {
-                inbound: inbound_rx,
-                outbound: outbound_tx,
-            }),
-            noise_state: TunnelNoiseState {
-                transport_state: initiator,
-                handshake_hash: vec![0u8; 32],
-            },
-            cbor_tx_recv,
-            cbor_rx_send,
-            close_rx,
-        };
-
-        assert!(connection(input).await.is_ok());
-        assert!(outbound_rx.try_recv().is_err(), "no frame is sent in reply");
-
-        drop((inbound_tx, cbor_tx_send, cbor_rx_recv, close_tx));
+        h.teardown(Teardown::Cancel);
+        assert!(handle.await.unwrap().is_ok());
     }
 }

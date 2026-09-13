@@ -4,6 +4,7 @@ mod crypto;
 mod data_channel;
 mod digit_encode;
 mod l2cap;
+mod linger;
 mod protocol;
 
 pub mod advertisement;

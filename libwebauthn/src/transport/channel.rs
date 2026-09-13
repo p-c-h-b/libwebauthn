@@ -71,7 +71,15 @@ pub trait Channel: Send + Sync + Display + Ctap2AuthTokenStore {
         &self,
     ) -> Result<SupportedProtocols, WebAuthnError<Self::TransportError>>;
     async fn status(&self) -> ChannelStatus;
+
+    /// Graceful close. Returns once the channel has been torn down.
     async fn close(&mut self);
+
+    /// Hard abort without a protocol-level goodbye. Falls back to
+    /// [`close`](Self::close) on transports without a distinct hard path.
+    async fn cancel(&mut self) {
+        self.close().await
+    }
 
     /// The transport this channel speaks over. Drives the registration response
     /// `transports` member and the `authenticatorAttachment` of both registration

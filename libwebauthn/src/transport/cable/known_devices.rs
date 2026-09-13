@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::transport::cable::channel::ConnectionState;
 use crate::transport::cable::connection_stages::{
-    connection_stage, handshake_stage, proximity_check_stage, ConnectionInput, HandshakeInput,
-    HandshakeOutput, MpscUxUpdateSender, ProximityCheckInput, TunnelConnectionInput,
-    UxUpdateSender,
+    connection_stage, handshake_stage, proximity_check_stage, until_teardown, ConnectionInput,
+    HandshakeInput, HandshakeOutput, MpscUxUpdateSender, ProximityCheckInput,
+    TunnelConnectionInput, UxUpdateSender,
 };
 
 use crate::transport::cable::error::CableError;
@@ -24,6 +24,7 @@ use tokio::task;
 use tracing::{debug, instrument, trace};
 
 use super::channel::CableChannel;
+use super::linger::Teardown;
 use super::protocol::{self, CableLinkingInfo};
 use super::Cable;
 
@@ -201,9 +202,11 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
         let (ux_update_sender, _) = broadcast::channel(16);
         let (cbor_tx_send, cbor_tx_recv) = mpsc::channel(16);
         let (cbor_rx_send, cbor_rx_recv) = mpsc::channel(16);
-        let (close_sender, close_rx) = mpsc::channel(1);
         let (connection_state_sender, connection_state_receiver) =
             watch::channel(ConnectionState::Connecting);
+        let (teardown_tx, teardown_rx) = watch::channel(Teardown::Active);
+        let teardown_tx = Arc::new(teardown_tx);
+        let mut teardown_rx_connect = teardown_rx.clone();
 
         let ux_update_sender_clone = ux_update_sender.clone();
         let known_device: CableKnownDevice = self.clone();
@@ -212,10 +215,19 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
             let ux_sender =
                 MpscUxUpdateSender::new(ux_update_sender_clone, connection_state_sender);
 
-            let handshake_output = match Self::connection(&known_device, &ux_sender).await {
-                Ok(handshake_output) => handshake_output,
-                Err(e) => {
+            let connecting = Self::connection(&known_device, &ux_sender);
+            let handshake_output = match until_teardown(connecting, &mut teardown_rx_connect).await
+            {
+                Some(Ok(handshake_output)) => handshake_output,
+                Some(Err(e)) => {
                     ux_sender.send_error(e).await;
+                    return;
+                }
+                None => {
+                    debug!("Hybrid connection torn down before the handshake completed");
+                    ux_sender
+                        .set_connection_state(ConnectionState::Terminated)
+                        .await;
                     return;
                 }
             };
@@ -225,10 +237,10 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
                 Some(known_device.store),
                 cbor_tx_recv,
                 cbor_rx_send,
-                close_rx,
+                teardown_rx,
             );
 
-            match protocol::connection(tunnel_input).await {
+            match protocol::connection(tunnel_input, &ux_sender).await {
                 Ok(()) => {
                     ux_sender
                         .set_connection_state(ConnectionState::Terminated)
@@ -248,7 +260,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
             ux_update_sender,
             connection_state_receiver,
             persistent_token_store: settings.persistent_token_store,
-            close_sender: Some(close_sender),
+            teardown: teardown_tx,
         })
     }
 }

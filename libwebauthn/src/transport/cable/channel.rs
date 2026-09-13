@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::{task, time};
-use tracing::error;
+use tracing::{debug, error, warn};
 
 use crate::pin::persistent_token::PersistentTokenStore;
 use crate::proto::{
@@ -22,7 +22,13 @@ use crate::Transport;
 use crate::UvUpdate;
 
 use super::known_devices::CableKnownDevice;
+use super::linger::Teardown;
 use super::qr_code_device::CableQrCodeDevice;
+
+/// Bounds `close()`: the Shutdown send plus the task's return.
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds `cancel()`: one select hop plus a socket drop. Aborts on expiry.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -52,10 +58,33 @@ pub struct CableChannel {
     pub(crate) ux_update_sender: broadcast::Sender<CableUxUpdate>,
     pub(crate) connection_state_receiver: watch::Receiver<ConnectionState>,
     pub(crate) persistent_token_store: Option<Arc<dyn PersistentTokenStore>>,
-    pub(crate) close_sender: Option<mpsc::Sender<()>>,
+    pub(crate) teardown: Arc<watch::Sender<Teardown>>,
 }
 
 impl CableChannel {
+    /// Sets the teardown intent if nobody has set one yet. Returns whether it did.
+    fn request_teardown(&self, intent: Teardown) -> bool {
+        self.teardown.send_if_modified(|current| {
+            if *current == Teardown::Active {
+                *current = intent;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Waits until the connection reaches a state matching `done`, bounded by `timeout`.
+    async fn wait_for_state(
+        &self,
+        timeout: Duration,
+        done: impl FnMut(&ConnectionState) -> bool,
+    ) -> bool {
+        let mut rx = self.connection_state_receiver.clone();
+        let reached = time::timeout(timeout, rx.wait_for(done)).await.is_ok();
+        reached
+    }
+
     async fn wait_for_connection(&self) -> Result<(), CableError> {
         let mut rx = self.connection_state_receiver.clone();
 
@@ -98,7 +127,11 @@ impl Display for CableChannel {
 
 impl Drop for CableChannel {
     fn drop(&mut self) {
-        self.handle_connection.abort();
+        // An unattended drop is a hard cancel. A teardown already under way
+        // (close, linger, cancel) is left to run its course.
+        if self.request_teardown(Teardown::Cancel) {
+            self.handle_connection.abort();
+        }
     }
 }
 
@@ -151,15 +184,32 @@ impl Channel for CableChannel {
         }
     }
 
+    /// Sends Shutdown, then waits for the connection to terminate. Never lingers.
     async fn close(&mut self) {
-        // Signal the loop to send Shutdown, then wait for it to flush and terminate.
-        if let Some(close_sender) = self.close_sender.take() {
-            let _ = close_sender.send(()).await;
+        self.request_teardown(Teardown::Close);
+        if !self
+            .wait_for_state(CLOSE_FLUSH_TIMEOUT, |state| {
+                *state == ConnectionState::Terminated
+            })
+            .await
+        {
+            warn!("Timed out waiting for the hybrid connection to close");
         }
-        let mut connection_state = self.connection_state_receiver.clone();
-        let _ = connection_state
-            .wait_for(|state| *state == ConnectionState::Terminated)
-            .await;
+    }
+
+    /// Drops the connection without sending Shutdown. Always wins over a
+    /// graceful teardown already under way.
+    async fn cancel(&mut self) {
+        self.teardown.send_replace(Teardown::Cancel);
+        if !self
+            .wait_for_state(CANCEL_TIMEOUT, |state| {
+                *state == ConnectionState::Terminated
+            })
+            .await
+        {
+            debug!("Aborting the hybrid connection task after cancel timeout");
+            self.handle_connection.abort();
+        }
     }
 
     async fn apdu_send(
@@ -251,7 +301,7 @@ mod tests {
         let (ux_update_sender, _) = broadcast::channel(1);
         let (cbor_sender, _cbor_tx_recv) = mpsc::channel(1);
         let (_cbor_rx_send, cbor_receiver) = mpsc::channel(1);
-        let (close_sender, _close_rx) = mpsc::channel(1);
+        let (teardown, _teardown_rx) = watch::channel(Teardown::Active);
         let (state_tx, connection_state_receiver) = watch::channel(state);
         let channel = CableChannel {
             handle_connection: task::spawn(std::future::pending()),
@@ -260,9 +310,95 @@ mod tests {
             ux_update_sender,
             connection_state_receiver,
             persistent_token_store: None,
-            close_sender: Some(close_sender),
+            teardown: Arc::new(teardown),
         };
         (channel, state_tx)
+    }
+
+    /// A channel whose task mimics the connection loop's teardown handling:
+    /// it publishes `Terminated` on any intent and reports the intent seen.
+    fn channel_with_teardown_task() -> (
+        CableChannel,
+        tokio::sync::oneshot::Receiver<Teardown>,
+        Arc<watch::Sender<Teardown>>,
+    ) {
+        let (ux_update_sender, _) = broadcast::channel(1);
+        let (cbor_sender, _cbor_tx_recv) = mpsc::channel(1);
+        let (_cbor_rx_send, cbor_receiver) = mpsc::channel(1);
+        let (teardown, mut teardown_rx) = watch::channel(Teardown::Active);
+        let teardown = Arc::new(teardown);
+        let (state_tx, connection_state_receiver) = watch::channel(ConnectionState::Connected);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let handle_connection = task::spawn(async move {
+            let intent = super::super::connection_stages::next_teardown(&mut teardown_rx).await;
+            let _ = seen_tx.send(intent);
+            let _ = state_tx.send(ConnectionState::Terminated);
+        });
+        let channel = CableChannel {
+            handle_connection,
+            cbor_sender,
+            cbor_receiver,
+            ux_update_sender,
+            connection_state_receiver,
+            persistent_token_store: None,
+            teardown: teardown.clone(),
+        };
+        (channel, seen_rx, teardown)
+    }
+
+    #[tokio::test]
+    async fn close_requests_graceful_close_and_waits_for_termination() {
+        let (mut channel, seen_rx, teardown) = channel_with_teardown_task();
+        channel.close().await;
+        assert_eq!(seen_rx.await.unwrap(), Teardown::Close);
+        assert_eq!(
+            *channel.connection_state_receiver.borrow(),
+            ConnectionState::Terminated
+        );
+        assert_eq!(*teardown.borrow(), Teardown::Close);
+        assert!(matches!(channel.status().await, ChannelStatus::Closed));
+    }
+
+    #[tokio::test]
+    async fn cancel_requests_hard_cancel() {
+        let (mut channel, seen_rx, teardown) = channel_with_teardown_task();
+        channel.cancel().await;
+        assert_eq!(seen_rx.await.unwrap(), Teardown::Cancel);
+        assert_eq!(*teardown.borrow(), Teardown::Cancel);
+    }
+
+    #[tokio::test]
+    async fn cancel_overrides_a_close_in_progress() {
+        let (mut channel, _seen_rx, teardown) = channel_with_teardown_task();
+        assert!(channel.request_teardown(Teardown::Close));
+        channel.cancel().await;
+        assert_eq!(*teardown.borrow(), Teardown::Cancel);
+    }
+
+    #[tokio::test]
+    async fn unattended_drop_cancels_and_aborts() {
+        let (channel, seen_rx, teardown) = channel_with_teardown_task();
+        drop(channel);
+        assert_eq!(*teardown.borrow(), Teardown::Cancel);
+        // The task was aborted, so it never reported the intent it saw.
+        assert!(seen_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn drop_after_close_does_not_downgrade_the_intent() {
+        let (mut channel, seen_rx, teardown) = channel_with_teardown_task();
+        channel.close().await;
+        drop(channel);
+        assert_eq!(*teardown.borrow(), Teardown::Close);
+        assert_eq!(seen_rx.await.unwrap(), Teardown::Close);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_aborts_a_task_that_ignores_the_intent() {
+        let (mut channel, _state_tx) = channel_in_state(ConnectionState::Connected);
+        channel.cancel().await;
+        let joined = (&mut channel.handle_connection).await;
+        assert!(joined.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
