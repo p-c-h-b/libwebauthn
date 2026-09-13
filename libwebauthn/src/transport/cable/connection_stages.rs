@@ -427,3 +427,38 @@ pub(crate) fn decode_tunnel_domain_from_advert(
             CableError::InvalidFraming
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn until_teardown_drops_a_pending_connect_on_any_intent() {
+        let (tx, mut rx) = watch::channel(Teardown::Active);
+        let started = tokio::time::Instant::now();
+        let connect = until_teardown(std::future::pending::<()>(), &mut rx);
+        tx.send_replace(Teardown::Close);
+        assert!(connect.await.is_none());
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn until_teardown_yields_the_output_when_undisturbed() {
+        let (_tx, mut rx) = watch::channel(Teardown::Active);
+        assert_eq!(until_teardown(async { 7 }, &mut rx).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn until_teardown_prefers_an_intent_over_a_ready_connect() {
+        let (tx, mut rx) = watch::channel(Teardown::Active);
+        tx.send_replace(Teardown::Cancel);
+        assert_eq!(until_teardown(async { 7 }, &mut rx).await, None);
+    }
+
+    #[tokio::test]
+    async fn next_teardown_treats_a_dropped_sender_as_cancel() {
+        let (tx, mut rx) = watch::channel(Teardown::Active);
+        drop(tx);
+        assert_eq!(next_teardown(&mut rx).await, Teardown::Cancel);
+    }
+}
