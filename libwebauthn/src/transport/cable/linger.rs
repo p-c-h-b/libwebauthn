@@ -1,16 +1,5 @@
 //! Caller-driven teardown of hybrid connections, and the registry that tracks
 //! connections left lingering for a late linking update.
-//!
-//! After a QR-initiated ceremony the authenticator may send its linking
-//! information a while after the CTAP response. Capturing it needs the
-//! connection to stay open after the caller is done with the channel. A
-//! caller opts in by carrying a [`CableLingerConfig`] on its
-//! [`ChannelSettings`](crate::transport::ChannelSettings) and calling
-//! [`CableChannel::linger`](super::channel::CableChannel::linger) once the
-//! ceremony has completed. The same [`CableLingerRegistry`] instance must be
-//! threaded through every hybrid `channel()` call of one logical client: a
-//! new connection evicts any connection still lingering, and the registry is
-//! the only handle left once the channel has been dropped.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,10 +8,6 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-/// Default linger window. The spec asks for at least two minutes after Shutdown.
-pub const DEFAULT_LINGER: Duration = Duration::from_secs(120);
-/// Absolute ceiling on a linger, whatever the configured window. Matches Chromium.
-pub const HARD_CAP: Duration = Duration::from_secs(180);
 /// Concurrent detached lingerers per registry. The oldest is evicted on overflow.
 pub(crate) const MAX_LINGERING: usize = 8;
 
@@ -43,19 +28,35 @@ pub(crate) enum Teardown {
 
 /// Opt-in to lingering, carried on
 /// [`ChannelSettings::cable_linger`](crate::transport::ChannelSettings::cable_linger).
+///
+/// After a QR-initiated ceremony the authenticator may send its linking
+/// information a while after the CTAP response. Capturing it needs the
+/// connection to stay open after the caller is done with the channel, which
+/// only happens when the caller calls
+/// [`CableChannel::linger`](super::channel::CableChannel::linger) once the
+/// ceremony has completed. Closing or dropping the channel captures nothing.
+///
+/// Carrying a config also makes opening a new hybrid channel evict any
+/// connection still lingering in the same [`CableLingerRegistry`].
 #[derive(Debug, Clone)]
 pub struct CableLingerConfig {
-    /// Tracks lingering connections across ceremonies. Share one instance per client.
+    /// Tracks lingering connections across ceremonies. Thread the same instance
+    /// through every hybrid `channel()` call of one logical client.
     pub registry: CableLingerRegistry,
-    /// How long to keep receiving after Shutdown. Clamped to [`HARD_CAP`].
+    /// How long to keep receiving after Shutdown. Clamped to [`Self::HARD_CAP`].
     pub linger_duration: Duration,
 }
 
 impl CableLingerConfig {
+    /// Default linger window. The spec asks for at least two minutes after Shutdown.
+    pub const DEFAULT_DURATION: Duration = Duration::from_secs(120);
+    /// Absolute ceiling on a linger, whatever the configured window. Matches Chromium.
+    pub const HARD_CAP: Duration = Duration::from_secs(180);
+
     pub fn new(registry: CableLingerRegistry) -> Self {
         Self {
             registry,
-            linger_duration: DEFAULT_LINGER,
+            linger_duration: Self::DEFAULT_DURATION,
         }
     }
 }
@@ -74,15 +75,23 @@ impl RegistryInner {
 
 impl Drop for RegistryInner {
     fn drop(&mut self) {
-        for tx in self.entries.values() {
+        // Connections still in use stay owned by their channel.
+        for tx in self.entries.values().filter(|tx| Self::is_lingering(tx)) {
             tx.send_replace(Teardown::Cancel);
         }
     }
 }
 
 /// Tracks hybrid connections from creation so that a lingering one can be
-/// evicted after its channel is gone. Cheap to clone. The caller holds the
-/// only strong reference: dropping the last clone cancels every lingerer.
+/// evicted after its channel is gone. Cheap to clone.
+///
+/// Close-on-new and eviction only apply to channels opened with the same
+/// registry instance. A channel opened without it neither evicts nor can be
+/// evicted, so use one registry per logical client, and independent registries
+/// for independent concurrent clients. The caller holds the only strong
+/// references: dropping the last clone cancels every connection that is
+/// lingering, and a connection whose registry is gone by the time it would
+/// linger closes instead. Connections still in use are never affected.
 #[derive(Clone, Default)]
 pub struct CableLingerRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -163,6 +172,14 @@ pub(crate) struct RegistryGuard {
     id: u64,
 }
 
+impl RegistryGuard {
+    /// Whether the registry still exists. Without it a linger would be
+    /// untracked, so the connection closes instead.
+    pub(crate) fn is_live(&self) -> bool {
+        self.inner.strong_count() > 0
+    }
+}
+
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.upgrade() {
@@ -196,7 +213,7 @@ impl LingerParams {
             return None;
         }
         Some(Self {
-            linger_duration: config.linger_duration.min(HARD_CAP),
+            linger_duration: config.linger_duration.min(CableLingerConfig::HARD_CAP),
             guard: config.registry.register(tx.clone()),
         })
     }
@@ -269,10 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_registry_cancels_everything() {
+    fn dropping_the_registry_cancels_lingerers_only() {
         let registry = CableLingerRegistry::new();
-        let (lingering, _g1) = entry(&registry);
-        let (active, _g2) = entry(&registry);
+        let (lingering, g1) = entry(&registry);
+        let (active, g2) = entry(&registry);
         lingering.send_replace(Teardown::Linger);
 
         let clone = registry.clone();
@@ -282,9 +299,12 @@ mod tests {
             Teardown::Linger,
             "a clone keeps it alive"
         );
+        assert!(g1.is_live());
         drop(clone);
         assert_eq!(*lingering.borrow(), Teardown::Cancel);
-        assert_eq!(*active.borrow(), Teardown::Cancel);
+        assert_eq!(*active.borrow(), Teardown::Active);
+        assert!(!g1.is_live());
+        assert!(!g2.is_live());
     }
 
     #[test]
@@ -297,7 +317,7 @@ mod tests {
         assert!(LingerParams::new(None, true, &tx).is_none());
         assert!(LingerParams::new(Some(&config), false, &tx).is_none());
         let params = LingerParams::new(Some(&config), true, &tx).expect("eligible");
-        assert_eq!(params.linger_duration, DEFAULT_LINGER);
+        assert_eq!(params.linger_duration, CableLingerConfig::DEFAULT_DURATION);
         tx.send_replace(Teardown::Linger);
         assert_eq!(registry.lingering_count(), 1);
     }
@@ -305,9 +325,9 @@ mod tests {
     #[test]
     fn linger_duration_is_clamped_to_the_hard_cap() {
         let mut config = CableLingerConfig::new(CableLingerRegistry::new());
-        config.linger_duration = HARD_CAP * 2;
+        config.linger_duration = CableLingerConfig::HARD_CAP * 2;
         let (tx, _rx) = watch::channel(Teardown::Active);
         let params = LingerParams::new(Some(&config), true, &Arc::new(tx)).expect("eligible");
-        assert_eq!(params.linger_duration, HARD_CAP);
+        assert_eq!(params.linger_duration, CableLingerConfig::HARD_CAP);
     }
 }

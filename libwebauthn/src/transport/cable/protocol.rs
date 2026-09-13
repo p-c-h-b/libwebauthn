@@ -27,10 +27,10 @@ use crate::transport::cable::connection_stages::{
 };
 use crate::transport::cable::error::CableError;
 use crate::transport::cable::known_devices::CableKnownDeviceId;
-use crate::transport::cable::linger::{LingerParams, Teardown, HARD_CAP};
+use crate::transport::cable::linger::{CableLingerConfig, LingerParams, Teardown};
 
 const P256_X962_LENGTH: usize = 65;
-pub(crate) const MAX_CBOR_SIZE: usize = 1024 * 1024;
+const MAX_CBOR_SIZE: usize = 1024 * 1024;
 const PADDING_GRANULARITY: usize = 32;
 
 /// Bounds every outbound send, so a dead socket cannot stall teardown.
@@ -425,7 +425,9 @@ pub(crate) async fn connection(
         CableTunnelConnectionType::QrCode { .. }
     ) && input.known_device_store.is_some();
     match input.linger.take() {
-        Some(params) if eligible => linger(input, params, ux_sender).await,
+        Some(params) if eligible && params.guard.is_live() => {
+            linger(input, params, ux_sender).await
+        }
         _ => {}
     }
     Ok(())
@@ -439,7 +441,7 @@ enum LingerStep {
 
 /// Keeps receiving after Shutdown to capture a late linking update. Detached
 /// from the channel, so every await is bounded and the whole phase sits under
-/// an absolute ceiling of [`HARD_CAP`].
+/// an absolute ceiling of [`CableLingerConfig::HARD_CAP`].
 async fn linger(
     mut input: TunnelConnectionInput,
     params: LingerParams,
@@ -452,7 +454,7 @@ async fn linger(
 
     let now = tokio::time::Instant::now();
     let deadline = now + params.linger_duration;
-    let hard_cap = now + HARD_CAP;
+    let hard_cap = now + CableLingerConfig::HARD_CAP;
     let mut decrypt_failures = 0u32;
 
     let run = async {
@@ -486,13 +488,16 @@ async fn linger(
                     match tokio::time::timeout(STORE_WRITE_TIMEOUT, step).await {
                         Ok(Ok(LingerStep::Keep)) => decrypt_failures = 0,
                         Ok(Ok(LingerStep::PeerClosed)) => break,
-                        Ok(Err(e)) => {
+                        // A desynced peer fails every following frame. Anything
+                        // else that decrypts is merely ignored.
+                        Ok(Err(CableError::EncryptionFailed)) => {
                             decrypt_failures += 1;
-                            warn!({ ?e, decrypt_failures }, "Undecodable frame while lingering");
+                            warn!(decrypt_failures, "Undecryptable frame while lingering");
                             if decrypt_failures >= DECRYPT_FAILURE_BUDGET {
                                 break;
                             }
                         }
+                        Ok(Err(e)) => debug!(?e, "Ignoring undecodable frame while lingering"),
                         Err(_elapsed) => {
                             warn!("Timed out processing a frame while lingering");
                             break;
@@ -813,14 +818,19 @@ async fn connection_recv(
             Ok(RecvOutcome::Continue)
         }
         CableTunnelMessageType::Update => {
-            handle_update_message(
+            let update = handle_update_message(
                 connection_type,
                 tunnel_domain,
                 known_device_store,
                 &cable_message.payload,
                 &noise_state.handshake_hash,
-            )
-            .await;
+            );
+            if tokio::time::timeout(STORE_WRITE_TIMEOUT, update)
+                .await
+                .is_err()
+            {
+                warn!("Timed out storing a linking update; ignoring it");
+            }
             Ok(RecvOutcome::Continue)
         }
     }
@@ -1073,7 +1083,10 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use crate::transport::cable::channel::{CableUxUpdate, ConnectionState};
-    use crate::transport::cable::linger::{CableLingerRegistry, DEFAULT_LINGER};
+    use crate::transport::cable::linger::CableLingerRegistry;
+
+    const DEFAULT_LINGER: Duration = CableLingerConfig::DEFAULT_DURATION;
+    const HARD_CAP: Duration = CableLingerConfig::HARD_CAP;
 
     /// In-memory data channel: records outbound frames and replays queued inbound ones.
     struct TestDataChannel {
@@ -1086,6 +1099,22 @@ mod tests {
         async fn send(&mut self, message: &[u8]) -> Result<(), CableError> {
             let _ = self.outbound.send(message.to_vec());
             Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>, CableError> {
+            Ok(self.inbound.recv().await)
+        }
+    }
+
+    /// A data channel whose sends never complete, like a stalled socket.
+    struct WedgedSendChannel {
+        inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl CableDataChannel for WedgedSendChannel {
+        async fn send(&mut self, _message: &[u8]) -> Result<(), CableError> {
+            std::future::pending().await
         }
 
         async fn recv(&mut self) -> Result<Option<Vec<u8>>, CableError> {
@@ -1340,6 +1369,16 @@ mod tests {
             self
         }
 
+        /// Replaces the data channel with one whose sends stall forever.
+        fn with_wedged_send(mut self) -> Self {
+            let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            self.inbound_tx = inbound_tx;
+            self.input_mut().data_channel = Box::new(WedgedSendChannel {
+                inbound: inbound_rx,
+            });
+            self
+        }
+
         /// Registers the connection with `registry` as an eligible lingerer.
         fn with_linger(
             mut self,
@@ -1419,6 +1458,7 @@ mod tests {
         h.send_initial_message();
         let handle = h.spawn();
 
+        h.await_active().await;
         h.teardown(Teardown::Close);
 
         assert_eq!(
@@ -1673,8 +1713,10 @@ mod tests {
         h.start_linger().await;
         h.wait_for_state(ConnectionState::Lingering).await;
 
+        let started = tokio::time::Instant::now();
         h.send_peer_frame(vec![CableTunnelMessageType::Ctap as u8, 0x00]);
         assert!(handle.await.unwrap().is_ok());
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
         assert!(h.cbor_rx_recv.try_recv().is_err());
     }
 
@@ -1688,6 +1730,7 @@ mod tests {
         h.start_linger().await;
         assert!(handle.await.unwrap().is_ok());
         assert_ne!(*h.state_rx.borrow(), ConnectionState::Lingering);
+        assert_eq!(registry.lingering_count(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1702,6 +1745,7 @@ mod tests {
         h.start_linger().await;
         assert!(handle.await.unwrap().is_ok());
         assert_ne!(*h.state_rx.borrow(), ConnectionState::Lingering);
+        assert_eq!(registry.lingering_count(), 0);
     }
 
     #[tokio::test]
@@ -1717,6 +1761,129 @@ mod tests {
             h.next_outbound_type().await,
             CableTunnelMessageType::Shutdown as u8
         );
+        assert!(handle.await.unwrap().is_ok());
+        assert_ne!(*h.state_rx.borrow(), ConnectionState::Lingering);
+        assert_eq!(registry.lingering_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wedged_store_write_in_the_active_phase_does_not_block_close() {
+        let qr_private_key = NonZeroScalar::random(&mut OsRng);
+        let mut h =
+            Harness::new(qr_connection_type_with(qr_private_key)).with_store(Arc::new(WedgedStore));
+        h.send_initial_message();
+        let handle = h.spawn();
+        h.await_active().await;
+
+        let (payload, _) = signed_update_payload(&qr_private_key, &[0u8; 32]);
+        h.send_peer_frame(payload);
+        tokio::task::yield_now().await;
+        let started = tokio::time::Instant::now();
+        h.teardown(Teardown::Close);
+
+        assert_eq!(
+            h.next_outbound_type().await,
+            CableTunnelMessageType::Shutdown as u8
+        );
+        assert!(handle.await.unwrap().is_ok());
+        assert_eq!(started.elapsed(), STORE_WRITE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_with_a_wedged_socket_terminates_at_send_timeout() {
+        let mut h = Harness::qr().with_wedged_send();
+        h.send_initial_message();
+        let handle = h.spawn();
+        h.await_active().await;
+
+        let started = tokio::time::Instant::now();
+        h.teardown(Teardown::Close);
+        assert!(handle.await.unwrap().is_ok());
+        assert_eq!(started.elapsed(), SEND_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cbor_send_on_a_wedged_socket_fails_at_send_timeout() {
+        let mut h = Harness::qr().with_wedged_send();
+        h.send_initial_message();
+        let handle = h.spawn();
+        h.await_active().await;
+
+        let started = tokio::time::Instant::now();
+        h.cbor_tx_send
+            .send(CborRequest::new(Ctap2CommandCode::AuthenticatorClientPin))
+            .await
+            .unwrap();
+        assert!(matches!(handle.await.unwrap(), Err(CableError::Timeout)));
+        assert_eq!(started.elapsed(), SEND_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decrypt_failures_below_the_budget_keep_the_linger_alive() {
+        let qr_private_key = NonZeroScalar::random(&mut OsRng);
+        let (puts_tx, mut puts_rx) = mpsc::unbounded_channel();
+        let registry = CableLingerRegistry::new();
+        let mut h = Harness::new(qr_connection_type_with(qr_private_key))
+            .with_store(Arc::new(NotifyingStore { puts: puts_tx }))
+            .with_linger(&registry, DEFAULT_LINGER);
+        h.send_initial_message();
+        let handle = h.spawn();
+
+        h.start_linger().await;
+        h.wait_for_state(ConnectionState::Lingering).await;
+
+        for _ in 0..DECRYPT_FAILURE_BUDGET - 1 {
+            h.inbound_tx.send(vec![0xFFu8; 48]).unwrap();
+        }
+        // A good frame resets the count and is still applied.
+        let (payload, device_id) = signed_update_payload(&qr_private_key, &[0u8; 32]);
+        h.send_peer_frame(payload);
+        assert_eq!(puts_rx.recv().await.unwrap(), device_id);
+        assert_eq!(registry.lingering_count(), 1);
+
+        for _ in 0..DECRYPT_FAILURE_BUDGET - 1 {
+            h.inbound_tx.send(vec![0xFFu8; 48]).unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(registry.lingering_count(), 1, "still under the budget");
+
+        h.inbound_tx.send(vec![0xFFu8; 48]).unwrap();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_frame_types_are_ignored_while_lingering() {
+        let registry = CableLingerRegistry::new();
+        let mut h = Harness::qr()
+            .with_store(Arc::new(RecordingStore::default()))
+            .with_linger(&registry, Duration::from_secs(10));
+        h.send_initial_message();
+        let handle = h.spawn();
+
+        h.start_linger().await;
+        h.wait_for_state(ConnectionState::Lingering).await;
+
+        let started = tokio::time::Instant::now();
+        for _ in 0..DECRYPT_FAILURE_BUDGET + 1 {
+            // Decrypts fine, unknown type byte (e.g. a CTAP 2.3 JSON frame).
+            h.send_peer_frame(vec![3, 0x00]);
+        }
+        assert!(handle.await.unwrap().is_ok());
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn linger_with_a_dropped_registry_is_a_close() {
+        let registry = CableLingerRegistry::new();
+        let mut h = Harness::qr()
+            .with_store(Arc::new(RecordingStore::default()))
+            .with_linger(&registry, DEFAULT_LINGER);
+        h.send_initial_message();
+        let handle = h.spawn();
+        h.await_active().await;
+
+        drop(registry);
+        h.start_linger().await;
         assert!(handle.await.unwrap().is_ok());
         assert_ne!(*h.state_rx.borrow(), ConnectionState::Lingering);
     }
