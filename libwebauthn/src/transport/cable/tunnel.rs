@@ -3,8 +3,9 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::{header::LOCATION, StatusCode};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, trace};
 use tungstenite::client::IntoClientRequest;
 use url::Url;
@@ -16,6 +17,16 @@ use crate::proto::ctap2::cbor;
 use crate::transport::cable::error::CableError;
 
 const MAX_TUNNEL_REDIRECTS: usize = 5;
+/// Largest tunnel message accepted from the server: the CBOR bound plus the
+/// type byte, padding and AEAD tag. Everything larger is rejected before it
+/// is buffered.
+const MAX_WS_MESSAGE_SIZE: usize = super::protocol::MAX_CBOR_SIZE + 64;
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_WS_MESSAGE_SIZE))
+}
 
 fn ensure_rustls_crypto_provider() {
     use std::sync::Once;
@@ -139,7 +150,8 @@ pub(crate) async fn connect(
         let request = build_tunnel_request(&connect_url, connection_type)?;
         trace!(?request);
 
-        let error = match connect_async(request).await {
+        let error = match connect_async_with_config(request, Some(websocket_config()), false).await
+        {
             Ok((ws_stream, response)) => {
                 debug!(?response, "Connected to tunnel server");
                 if response.status() != StatusCode::SWITCHING_PROTOCOLS {
@@ -188,6 +200,16 @@ mod tests {
     use super::*;
     use crate::transport::cable::known_devices::{ClientPayload, ClientPayloadHint};
     use p256::NonZeroScalar;
+
+    #[test]
+    fn websocket_config_bounds_message_and_frame_size() {
+        let config = websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_WS_MESSAGE_SIZE));
+        assert_eq!(config.max_frame_size, Some(MAX_WS_MESSAGE_SIZE));
+        let default = WebSocketConfig::default();
+        assert!(Some(MAX_WS_MESSAGE_SIZE) < default.max_message_size);
+        assert!(Some(MAX_WS_MESSAGE_SIZE) < default.max_frame_size);
+    }
     use rand::rngs::OsRng;
     use serde_bytes::ByteBuf;
 

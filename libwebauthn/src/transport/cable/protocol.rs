@@ -30,7 +30,7 @@ use crate::transport::cable::known_devices::CableKnownDeviceId;
 use crate::transport::cable::linger::{LingerParams, Teardown, HARD_CAP};
 
 const P256_X962_LENGTH: usize = 65;
-const MAX_CBOR_SIZE: usize = 1024 * 1024;
+pub(crate) const MAX_CBOR_SIZE: usize = 1024 * 1024;
 const PADDING_GRANULARITY: usize = 32;
 
 /// Bounds every outbound send, so a dead socket cannot stall teardown.
