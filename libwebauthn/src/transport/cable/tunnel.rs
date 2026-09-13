@@ -17,10 +17,10 @@ use crate::proto::ctap2::cbor;
 use crate::transport::cable::error::CableError;
 
 const MAX_TUNNEL_REDIRECTS: usize = 5;
-/// Largest tunnel message accepted from the server: the CBOR bound plus the
-/// type byte, padding and AEAD tag. Everything larger is rejected before it
-/// is buffered.
-const MAX_WS_MESSAGE_SIZE: usize = super::protocol::MAX_CBOR_SIZE + 64;
+/// Largest tunnel message accepted from the server. A Noise transport message
+/// is at most 65535 bytes, so nothing larger could be decrypted anyway.
+/// Everything above is rejected before it is buffered.
+const MAX_WS_MESSAGE_SIZE: usize = 65535;
 
 fn websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
@@ -201,6 +201,9 @@ mod tests {
     use crate::transport::cable::known_devices::{ClientPayload, ClientPayloadHint};
     use p256::NonZeroScalar;
 
+    use rand::rngs::OsRng;
+    use serde_bytes::ByteBuf;
+
     #[test]
     fn websocket_config_bounds_message_and_frame_size() {
         let config = websocket_config();
@@ -210,8 +213,34 @@ mod tests {
         assert!(Some(MAX_WS_MESSAGE_SIZE) < default.max_message_size);
         assert!(Some(MAX_WS_MESSAGE_SIZE) < default.max_frame_size);
     }
-    use rand::rngs::OsRng;
-    use serde_bytes::ByteBuf;
+
+    #[test]
+    fn websocket_bound_matches_the_noise_message_ceiling() {
+        // snow rejects transport messages above 65535 bytes, so the bound
+        // admits every decryptable frame and nothing more.
+        let mut initiator = snow::Builder::new("Noise_NN_P256_AESGCM_SHA256".parse().unwrap())
+            .build_initiator()
+            .unwrap();
+        let mut responder = snow::Builder::new("Noise_NN_P256_AESGCM_SHA256".parse().unwrap())
+            .build_responder()
+            .unwrap();
+        let mut a = [0u8; 1024];
+        let mut b = [0u8; 1024];
+        let n = initiator.write_message(&[], &mut a).unwrap();
+        responder.read_message(&a[..n], &mut b).unwrap();
+        let n = responder.write_message(&[], &mut a).unwrap();
+        initiator.read_message(&a[..n], &mut b).unwrap();
+        let mut responder = responder.into_transport_mode().unwrap();
+        let mut out = vec![0u8; MAX_WS_MESSAGE_SIZE + 1];
+        assert!(matches!(
+            responder.read_message(&vec![0u8; MAX_WS_MESSAGE_SIZE + 1], &mut out),
+            Err(snow::Error::Input)
+        ));
+        assert!(matches!(
+            responder.read_message(&vec![0u8; MAX_WS_MESSAGE_SIZE], &mut out),
+            Err(snow::Error::Decrypt)
+        ));
+    }
 
     fn known_device_connection_type(public_key: Vec<u8>) -> CableTunnelConnectionType {
         CableTunnelConnectionType::KnownDevice {
