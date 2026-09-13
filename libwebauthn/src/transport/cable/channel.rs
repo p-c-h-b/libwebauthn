@@ -69,7 +69,10 @@ impl CableChannel {
     ///
     /// Only a state-assisted QR connection opened with a
     /// [`CableLingerConfig`](super::CableLingerConfig) can linger. Anything
-    /// else behaves like [`close`](Channel::close).
+    /// else behaves like [`close`](Channel::close). The linger runs on the
+    /// tokio runtime that opened the channel, which must outlive the window.
+    /// Call [`CableLingerRegistry::close_lingering`](super::CableLingerRegistry::close_lingering)
+    /// before shutting that runtime down.
     pub async fn linger(&mut self) {
         if !self.linger_eligible {
             return self.close().await;
@@ -210,16 +213,29 @@ impl Channel for CableChannel {
         }
     }
 
-    /// Sends Shutdown, then waits for the connection to terminate. Never lingers.
+    /// Sends Shutdown, then waits for the connection to terminate, cancelling
+    /// it if that takes too long. Never lingers, and never cuts short a
+    /// linger already requested.
     async fn close(&mut self) {
         self.request_teardown(Teardown::Close);
+        if *self.teardown.borrow() == Teardown::Linger {
+            self.wait_for_state(CLOSE_FLUSH_TIMEOUT, |state| {
+                matches!(
+                    state,
+                    ConnectionState::Lingering | ConnectionState::Terminated
+                )
+            })
+            .await;
+            return;
+        }
         if !self
             .wait_for_state(CLOSE_FLUSH_TIMEOUT, |state| {
                 *state == ConnectionState::Terminated
             })
             .await
         {
-            warn!("Timed out waiting for the hybrid connection to close");
+            warn!("Timed out waiting for the hybrid connection to close, cancelling it");
+            self.cancel().await;
         }
     }
 
@@ -404,11 +420,11 @@ mod tests {
     async fn close_requests_graceful_close_and_waits_for_termination() {
         let (mut channel, seen_rx, teardown) = channel_with_teardown_task();
         channel.close().await;
-        assert_eq!(seen_rx.await.unwrap(), Teardown::Close);
         assert_eq!(
             *channel.connection_state_receiver.borrow(),
             ConnectionState::Terminated
         );
+        assert_eq!(seen_rx.await.unwrap(), Teardown::Close);
         assert_eq!(*teardown.borrow(), Teardown::Close);
         assert!(matches!(channel.status().await, ChannelStatus::Closed));
     }
@@ -450,9 +466,88 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_aborts_a_task_that_ignores_the_intent() {
         let (mut channel, _state_tx) = channel_in_state(ConnectionState::Connected);
+        let started = time::Instant::now();
         channel.cancel().await;
+        assert_eq!(started.elapsed(), CANCEL_TIMEOUT);
         let joined = (&mut channel.handle_connection).await;
         assert!(joined.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_escalates_to_cancel_after_the_flush_timeout() {
+        let (mut channel, _state_tx) = channel_in_state(ConnectionState::Connected);
+        let started = time::Instant::now();
+        channel.close().await;
+        assert_eq!(started.elapsed(), CLOSE_FLUSH_TIMEOUT + CANCEL_TIMEOUT);
+        assert_eq!(*channel.teardown.borrow(), Teardown::Cancel);
+        let joined = (&mut channel.handle_connection).await;
+        assert!(joined.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn linger_gives_up_after_the_flush_timeout_without_aborting() {
+        let (mut channel, _state_tx) = channel_in_state(ConnectionState::Connected);
+        let started = time::Instant::now();
+        channel.linger().await;
+        assert_eq!(started.elapsed(), CLOSE_FLUSH_TIMEOUT);
+        assert_eq!(*channel.teardown.borrow(), Teardown::Linger);
+        assert!(!channel.handle_connection.is_finished());
+    }
+
+    /// A channel whose task publishes `Lingering` on the linger intent and
+    /// then stays alive, like the real linger phase.
+    fn channel_with_lingering_task() -> (CableChannel, task::AbortHandle) {
+        let (ux_update_sender, _) = broadcast::channel(1);
+        let (cbor_sender, _cbor_tx_recv) = mpsc::channel(1);
+        let (_cbor_rx_send, cbor_receiver) = mpsc::channel(1);
+        let (teardown, mut teardown_rx) = watch::channel(Teardown::Active);
+        let (state_tx, connection_state_receiver) = watch::channel(ConnectionState::Connected);
+        let handle_connection = task::spawn(async move {
+            let intent = super::super::connection_stages::next_teardown(&mut teardown_rx).await;
+            if intent == Teardown::Linger {
+                let _ = state_tx.send(ConnectionState::Lingering);
+                std::future::pending::<()>().await;
+            }
+            let _ = state_tx.send(ConnectionState::Terminated);
+        });
+        let abort = handle_connection.abort_handle();
+        let channel = CableChannel {
+            handle_connection,
+            cbor_sender,
+            cbor_receiver,
+            ux_update_sender,
+            connection_state_receiver,
+            persistent_token_store: None,
+            teardown: Arc::new(teardown),
+            linger_eligible: true,
+        };
+        (channel, abort)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn linger_returns_once_lingering_and_survives_drop() {
+        let (mut channel, abort) = channel_with_lingering_task();
+        let started = time::Instant::now();
+        channel.linger().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(matches!(channel.status().await, ChannelStatus::Closed));
+
+        drop(channel);
+        task::yield_now().await;
+        assert!(!abort.is_finished(), "the linger outlives the channel");
+        abort.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_after_linger_does_not_cut_the_linger_short() {
+        let (mut channel, abort) = channel_with_lingering_task();
+        channel.linger().await;
+        let started = time::Instant::now();
+        channel.close().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(*channel.teardown.borrow(), Teardown::Linger);
+        assert!(!abort.is_finished());
+        abort.abort();
     }
 
     #[tokio::test]
