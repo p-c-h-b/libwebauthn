@@ -25,11 +25,15 @@ use super::known_devices::CableKnownDevice;
 use super::qr_code_device::CableQrCodeDevice;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ConnectionState {
     /// Connection is being established (proximity check, connecting, authenticating)
     Connecting,
     /// Connection is fully established and ready for operations
     Connected,
+    /// Shutdown has been sent and the connection is only receiving a late
+    /// linking update. No further operations are admitted.
+    Lingering,
     /// Connection has terminated
     Terminated,
 }
@@ -65,8 +69,10 @@ impl CableChannel {
         // surfaces the same variant as one that terminates while we wait;
         // the caller can't observe the timing difference and the asymmetry
         // was accidental.
-        if *rx.borrow() == ConnectionState::Terminated {
-            return Err(CableError::ConnectionFailed);
+        match *rx.borrow() {
+            ConnectionState::Terminated => return Err(CableError::ConnectionFailed),
+            ConnectionState::Lingering => return Err(CableError::ConnectionLost),
+            _ => {}
         }
 
         // Wait for state change
@@ -74,6 +80,7 @@ impl CableChannel {
             match *rx.borrow() {
                 ConnectionState::Connected => return Ok(()),
                 ConnectionState::Terminated => return Err(CableError::ConnectionFailed),
+                ConnectionState::Lingering => return Err(CableError::ConnectionLost),
                 ConnectionState::Connecting => continue,
             }
         }
@@ -135,9 +142,12 @@ impl Channel for CableChannel {
     }
 
     async fn status(&self) -> ChannelStatus {
-        match self.handle_connection.is_finished() {
-            true => ChannelStatus::Closed,
-            false => ChannelStatus::Ready,
+        if self.handle_connection.is_finished() {
+            return ChannelStatus::Closed;
+        }
+        match *self.connection_state_receiver.borrow() {
+            ConnectionState::Lingering | ConnectionState::Terminated => ChannelStatus::Closed,
+            _ => ChannelStatus::Ready,
         }
     }
 
@@ -230,5 +240,60 @@ impl Ctap2AuthTokenStore for CableChannel {
 
     fn persistent_token_store(&self) -> Option<Arc<dyn PersistentTokenStore>> {
         self.persistent_token_store.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel_in_state(state: ConnectionState) -> (CableChannel, watch::Sender<ConnectionState>) {
+        let (ux_update_sender, _) = broadcast::channel(1);
+        let (cbor_sender, _cbor_tx_recv) = mpsc::channel(1);
+        let (_cbor_rx_send, cbor_receiver) = mpsc::channel(1);
+        let (close_sender, _close_rx) = mpsc::channel(1);
+        let (state_tx, connection_state_receiver) = watch::channel(state);
+        let channel = CableChannel {
+            handle_connection: task::spawn(std::future::pending()),
+            cbor_sender,
+            cbor_receiver,
+            ux_update_sender,
+            connection_state_receiver,
+            persistent_token_store: None,
+            close_sender: Some(close_sender),
+        };
+        (channel, state_tx)
+    }
+
+    #[tokio::test]
+    async fn wait_for_connection_rejects_lingering() {
+        let (channel, _state_tx) = channel_in_state(ConnectionState::Lingering);
+        assert!(matches!(
+            channel.wait_for_connection().await,
+            Err(CableError::ConnectionLost)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_for_connection_rejects_transition_to_lingering() {
+        let (channel, state_tx) = channel_in_state(ConnectionState::Connecting);
+        let waiter = tokio::spawn(async move { channel.wait_for_connection().await });
+        state_tx.send(ConnectionState::Lingering).unwrap();
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(CableError::ConnectionLost)
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_maps_lingering_to_closed() {
+        let (channel, _state_tx) = channel_in_state(ConnectionState::Lingering);
+        assert!(matches!(channel.status().await, ChannelStatus::Closed));
+    }
+
+    #[tokio::test]
+    async fn status_maps_connected_to_ready() {
+        let (channel, _state_tx) = channel_in_state(ConnectionState::Connected);
+        assert!(matches!(channel.status().await, ChannelStatus::Ready));
     }
 }
