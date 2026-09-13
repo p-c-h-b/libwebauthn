@@ -169,10 +169,11 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         let mut channel = device.channel(settings()).await.unwrap();
         println!("Channel established {:?}", channel);
         run_get_assertion(&mut channel, &request_origin, &psl).await?;
-        channel.linger().await;
+        // Nothing follows that could use a linking update, so just close.
+        channel.close().await;
     }
 
-    // Drain anything still lingering before the runtime goes away.
+    // Signal any lingering connection to stop before the runtime goes away.
     linger_registry.close_lingering();
     Ok(())
 }
