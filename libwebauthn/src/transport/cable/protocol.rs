@@ -46,9 +46,6 @@ impl CableTunnelMessage {
     }
     pub fn from_slice(slice: &[u8]) -> Result<Self, CableError> {
         let (type_byte, payload) = slice.split_first().ok_or(CableError::InvalidFraming)?;
-        if payload.is_empty() {
-            return Err(CableError::InvalidFraming);
-        }
 
         let message_type = match *type_byte {
             0 => CableTunnelMessageType::Shutdown,
@@ -58,6 +55,11 @@ impl CableTunnelMessage {
                 return Err(CableError::InvalidFraming);
             }
         };
+
+        // Shutdown is the type byte alone. Ctap and Update must carry a payload.
+        if payload.is_empty() && message_type != CableTunnelMessageType::Shutdown {
+            return Err(CableError::InvalidFraming);
+        }
 
         Ok(Self {
             message_type,
@@ -107,7 +109,7 @@ pub(crate) struct CableLinkingInfo {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 enum CableTunnelMessageType {
     Shutdown = 0,
     Ctap = 1,
@@ -814,6 +816,37 @@ mod tests {
     }
 
     #[test]
+    fn from_slice_accepts_type_only_shutdown() {
+        let message = CableTunnelMessage::from_slice(&[0]).unwrap();
+        assert_eq!(message.message_type, CableTunnelMessageType::Shutdown);
+        assert!(message.payload.is_empty());
+    }
+
+    #[test]
+    fn from_slice_rejects_empty_ctap_and_update() {
+        assert!(matches!(
+            CableTunnelMessage::from_slice(&[1]),
+            Err(CableError::InvalidFraming)
+        ));
+        assert!(matches!(
+            CableTunnelMessage::from_slice(&[2]),
+            Err(CableError::InvalidFraming)
+        ));
+    }
+
+    #[test]
+    fn from_slice_rejects_empty_frame_and_unknown_type() {
+        assert!(matches!(
+            CableTunnelMessage::from_slice(&[]),
+            Err(CableError::InvalidFraming)
+        ));
+        assert!(matches!(
+            CableTunnelMessage::from_slice(&[3, 0]),
+            Err(CableError::InvalidFraming)
+        ));
+    }
+
+    #[test]
     fn strip_frame_padding_rejects_empty() {
         let result = strip_frame_padding(Vec::new());
         assert!(matches!(result, Err(CableError::InvalidFraming)));
@@ -977,6 +1010,50 @@ mod tests {
         assert!(handle.await.unwrap().is_ok());
 
         // Keep the channel ends alive until the loop has shut down.
+        drop((inbound_tx, cbor_tx_send, cbor_rx_recv, close_tx));
+    }
+
+    #[tokio::test]
+    async fn peer_shutdown_ends_connection_cleanly() {
+        let (initiator, mut responder) = paired_transport_states();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        inbound_tx
+            .send(encrypted_initial_message(&mut responder))
+            .unwrap();
+        // A type-only Shutdown frame from the peer, padded like any other frame.
+        inbound_tx
+            .send(encrypt(
+                &mut responder,
+                &pad(vec![CableTunnelMessageType::Shutdown as u8]),
+            ))
+            .unwrap();
+
+        let (cbor_tx_send, cbor_tx_recv) = mpsc::channel::<CborRequest>(4);
+        let (cbor_rx_send, cbor_rx_recv) = mpsc::channel::<CborResponse>(4);
+        let (close_tx, close_rx) = mpsc::channel::<()>(1);
+
+        let input = TunnelConnectionInput {
+            connection_type: qr_connection_type(),
+            tunnel_domain: "cable.example.com".to_string(),
+            known_device_store: None,
+            data_channel: Box::new(TestDataChannel {
+                inbound: inbound_rx,
+                outbound: outbound_tx,
+            }),
+            noise_state: TunnelNoiseState {
+                transport_state: initiator,
+                handshake_hash: vec![0u8; 32],
+            },
+            cbor_tx_recv,
+            cbor_rx_send,
+            close_rx,
+        };
+
+        assert!(connection(input).await.is_ok());
+        assert!(outbound_rx.try_recv().is_err(), "no frame is sent in reply");
+
         drop((inbound_tx, cbor_tx_send, cbor_rx_recv, close_tx));
     }
 }
