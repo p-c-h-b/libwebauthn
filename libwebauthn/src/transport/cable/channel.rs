@@ -59,9 +59,35 @@ pub struct CableChannel {
     pub(crate) connection_state_receiver: watch::Receiver<ConnectionState>,
     pub(crate) persistent_token_store: Option<Arc<dyn PersistentTokenStore>>,
     pub(crate) teardown: Arc<watch::Sender<Teardown>>,
+    pub(crate) linger_eligible: bool,
 }
 
 impl CableChannel {
+    /// Sends Shutdown, then keeps the connection open in the background to
+    /// capture a late linking update. Returns once the connection is
+    /// lingering, not when the window ends, and the channel can be dropped.
+    ///
+    /// Only a state-assisted QR connection opened with a
+    /// [`CableLingerConfig`](super::CableLingerConfig) can linger. Anything
+    /// else behaves like [`close`](Channel::close).
+    pub async fn linger(&mut self) {
+        if !self.linger_eligible {
+            return self.close().await;
+        }
+        self.request_teardown(Teardown::Linger);
+        if !self
+            .wait_for_state(CLOSE_FLUSH_TIMEOUT, |state| {
+                matches!(
+                    state,
+                    ConnectionState::Lingering | ConnectionState::Terminated
+                )
+            })
+            .await
+        {
+            warn!("Timed out waiting for the hybrid connection to start lingering");
+        }
+    }
+
     /// Sets the teardown intent if nobody has set one yet. Returns whether it did.
     fn request_teardown(&self, intent: Teardown) -> bool {
         self.teardown.send_if_modified(|current| {
@@ -311,6 +337,7 @@ mod tests {
             connection_state_receiver,
             persistent_token_store: None,
             teardown: Arc::new(teardown),
+            linger_eligible: true,
         };
         (channel, state_tx)
     }
@@ -342,8 +369,35 @@ mod tests {
             connection_state_receiver,
             persistent_token_store: None,
             teardown: teardown.clone(),
+            linger_eligible: true,
         };
         (channel, seen_rx, teardown)
+    }
+
+    #[tokio::test]
+    async fn linger_requests_linger_on_an_eligible_channel() {
+        let (mut channel, seen_rx, teardown) = channel_with_teardown_task();
+        channel.linger().await;
+        assert_eq!(seen_rx.await.unwrap(), Teardown::Linger);
+        assert_eq!(*teardown.borrow(), Teardown::Linger);
+    }
+
+    #[tokio::test]
+    async fn linger_degrades_to_close_on_an_ineligible_channel() {
+        let (mut channel, seen_rx, teardown) = channel_with_teardown_task();
+        channel.linger_eligible = false;
+        channel.linger().await;
+        assert_eq!(seen_rx.await.unwrap(), Teardown::Close);
+        assert_eq!(*teardown.borrow(), Teardown::Close);
+    }
+
+    #[tokio::test]
+    async fn drop_after_linger_does_not_cancel() {
+        let (mut channel, seen_rx, teardown) = channel_with_teardown_task();
+        channel.linger().await;
+        drop(channel);
+        assert_eq!(*teardown.borrow(), Teardown::Linger);
+        assert_eq!(seen_rx.await.unwrap(), Teardown::Linger);
     }
 
     #[tokio::test]

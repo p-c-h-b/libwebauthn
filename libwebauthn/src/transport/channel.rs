@@ -10,6 +10,7 @@ use crate::proto::{
     ctap1::apdu::{ApduRequest, ApduResponse},
     ctap2::cbor::{CborRequest, CborResponse},
 };
+use crate::transport::cable::CableLingerConfig;
 use crate::webauthn::error::WebAuthnError;
 use crate::Transport;
 use crate::UvUpdate;
@@ -37,6 +38,9 @@ pub struct ChannelSettings {
     /// credential management reuses a stored token across sessions instead of
     /// re-prompting for the PIN. See [`PersistentTokenStore`].
     pub persistent_token_store: Option<Arc<dyn PersistentTokenStore>>,
+    /// Opt-in to keeping a hybrid connection open after the ceremony to capture
+    /// a late linking update. `None` disables it. See [`CableLingerConfig`].
+    pub cable_linger: Option<CableLingerConfig>,
 }
 
 #[async_trait]

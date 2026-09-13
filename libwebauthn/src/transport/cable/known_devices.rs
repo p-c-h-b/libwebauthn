@@ -208,6 +208,13 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
         let teardown_tx = Arc::new(teardown_tx);
         let mut teardown_rx_connect = teardown_rx.clone();
 
+        // A new connection supersedes any connection still lingering. Known
+        // device connections never linger themselves: their linking update
+        // cannot be verified and is discarded.
+        if let Some(config) = &settings.cable_linger {
+            config.registry.close_lingering();
+        }
+
         let ux_update_sender_clone = ux_update_sender.clone();
         let known_device: CableKnownDevice = self.clone();
 
@@ -238,6 +245,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
                 cbor_tx_recv,
                 cbor_rx_send,
                 teardown_rx,
+                None,
             );
 
             match protocol::connection(tunnel_input, &ux_sender).await {
@@ -261,6 +269,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableKnownDevice {
             connection_state_receiver,
             persistent_token_store: settings.persistent_token_store,
             teardown: teardown_tx,
+            linger_eligible: false,
         })
     }
 }

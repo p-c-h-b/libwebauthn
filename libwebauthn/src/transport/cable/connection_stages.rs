@@ -9,7 +9,7 @@ use super::crypto::{derive, KeyPurpose};
 use super::data_channel::{CableDataChannel, WebSocketDataChannel};
 use super::known_devices::{CableKnownDevice, CableKnownDeviceInfoStore, ClientNonce};
 use super::l2cap::L2capDataChannel;
-use super::linger::Teardown;
+use super::linger::{LingerParams, Teardown};
 use super::protocol::{self, CableTunnelConnectionType, TunnelNoiseState};
 use super::qr_code_device::CableQrCodeDevice;
 use super::tunnel;
@@ -204,6 +204,8 @@ pub(crate) struct TunnelConnectionInput {
     pub cbor_tx_recv: mpsc::Receiver<CborRequest>,
     pub cbor_rx_send: mpsc::Sender<CborResponse>,
     pub teardown_rx: watch::Receiver<Teardown>,
+    /// Present only when this connection may linger after Shutdown.
+    pub linger: Option<LingerParams>,
 }
 
 impl TunnelConnectionInput {
@@ -213,6 +215,7 @@ impl TunnelConnectionInput {
         cbor_tx_recv: mpsc::Receiver<CborRequest>,
         cbor_rx_send: mpsc::Sender<CborResponse>,
         teardown_rx: watch::Receiver<Teardown>,
+        linger: Option<LingerParams>,
     ) -> Self {
         Self {
             connection_type: handshake_output.connection_type,
@@ -223,6 +226,7 @@ impl TunnelConnectionInput {
             cbor_tx_recv,
             cbor_rx_send,
             teardown_rx,
+            linger,
         }
     }
 }

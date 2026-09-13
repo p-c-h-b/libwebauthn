@@ -20,7 +20,7 @@ use super::connection_stages::{
     HandshakeInput, MpscUxUpdateSender, ProximityCheckInput, TunnelConnectionInput, UxUpdateSender,
 };
 use super::known_devices::CableKnownDeviceInfoStore;
-use super::linger::Teardown;
+use super::linger::{LingerParams, Teardown};
 use super::protocol;
 use super::tunnel::KNOWN_TUNNEL_DOMAINS;
 use super::{channel::CableChannel, channel::ConnectionState, Cable};
@@ -211,6 +211,11 @@ impl CableQrCodeDevice {
         Self::new(hint, false, None, transports)
     }
 
+    /// Only a state-assisted QR connection with a store can use a late linking update.
+    fn linger_eligible(&self) -> bool {
+        self.qr_code.state_assisted == Some(true) && self.store.is_some()
+    }
+
     #[instrument(skip_all, err)]
     async fn connection(
         qr_device: &CableQrCodeDevice,
@@ -254,6 +259,17 @@ impl<'d> Device<'d, Cable, CableChannel> for CableQrCodeDevice {
         let teardown_tx = Arc::new(teardown_tx);
         let mut teardown_rx_connect = teardown_rx.clone();
 
+        // A new connection supersedes any connection still lingering.
+        if let Some(config) = &settings.cable_linger {
+            config.registry.close_lingering();
+        }
+        let linger = LingerParams::new(
+            settings.cable_linger.as_ref(),
+            self.linger_eligible(),
+            &teardown_tx,
+        );
+        let linger_eligible = linger.is_some();
+
         let ux_update_sender_clone = ux_update_sender.clone();
         let qr_device = self.clone();
 
@@ -284,6 +300,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableQrCodeDevice {
                 cbor_tx_recv,
                 cbor_rx_send,
                 teardown_rx,
+                linger,
             );
             match protocol::connection(tunnel_input, &ux_sender).await {
                 Ok(()) => {
@@ -306,6 +323,7 @@ impl<'d> Device<'d, Cable, CableChannel> for CableQrCodeDevice {
             connection_state_receiver,
             persistent_token_store: settings.persistent_token_store,
             teardown: teardown_tx,
+            linger_eligible,
         })
     }
 
@@ -326,6 +344,28 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CableQrCodeDevice>();
     };
+
+    #[test]
+    fn transient_qr_code_is_not_linger_eligible() {
+        let device = CableQrCodeDevice::new_transient(
+            QrCodeOperationHint::GetAssertionRequest,
+            CableTransports::CloudAssistedOnly,
+        )
+        .unwrap();
+        assert!(!device.linger_eligible());
+    }
+
+    #[test]
+    fn persistent_qr_code_is_linger_eligible() {
+        let store = Arc::new(super::super::known_devices::EphemeralDeviceInfoStore::new());
+        let device = CableQrCodeDevice::new_persistent(
+            QrCodeOperationHint::GetAssertionRequest,
+            store,
+            CableTransports::CloudAssistedOnly,
+        )
+        .unwrap();
+        assert!(device.linger_eligible());
+    }
 
     #[test]
     fn qr_code_omits_key_6_for_cloud_assisted_only() {
