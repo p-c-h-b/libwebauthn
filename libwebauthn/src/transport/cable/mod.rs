@@ -16,6 +16,7 @@ pub mod qr_code_device;
 pub mod tunnel;
 
 use super::Transport;
+pub use channel::CableClose;
 pub use digit_encode::digit_encode;
 pub use linger::{CableLingerConfig, CableLingerRegistry};
 

@@ -40,9 +40,9 @@ pub struct ChannelSettings {
     pub persistent_token_store: Option<Arc<dyn PersistentTokenStore>>,
     /// Opt-in to keeping a hybrid connection open after the ceremony to capture
     /// a late linking update. Enables close-on-new for this channel and lets
-    /// it linger when the caller calls
-    /// [`CableChannel::linger`](crate::transport::cable::channel::CableChannel::linger)
-    /// afterwards. Closing or dropping the channel captures nothing. `None`
+    /// it linger when the caller closes it with
+    /// [`CableClose::Linger`](crate::transport::cable::CableClose::Linger)
+    /// afterwards. An immediate close or a drop captures nothing. `None`
     /// disables it. Ignored by the other transports.
     pub cable_linger: Option<CableLingerConfig>,
 }
@@ -81,8 +81,10 @@ pub trait Channel: Send + Sync + Display + Ctap2AuthTokenStore {
     async fn status(&self) -> ChannelStatus;
 
     /// Graceful close. Hybrid sends its protocol-level goodbye and returns
-    /// once the connection has been torn down. HID, BLE and NFC release the
-    /// link when the channel is dropped, so this is a no-op there.
+    /// once the connection has been torn down (see
+    /// [`CableChannel::close`](crate::transport::cable::channel::CableChannel::close)
+    /// for the lingering variant). HID, BLE and NFC release the link when the
+    /// channel is dropped, so this is a no-op there.
     async fn close(&mut self);
 
     /// Hard abort without a protocol-level goodbye. Falls back to

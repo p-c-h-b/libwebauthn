@@ -8,7 +8,9 @@ use libwebauthn::transport::cable::known_devices::{
 use libwebauthn::transport::cable::qr_code_device::{
     CableQrCodeDevice, CableTransports, QrCodeOperationHint,
 };
-use libwebauthn::transport::cable::{is_available, CableLingerConfig, CableLingerRegistry};
+use libwebauthn::transport::cable::{
+    is_available, CableClose, CableLingerConfig, CableLingerRegistry,
+};
 use qrcode::render::unicode;
 use qrcode::QrCode;
 use tokio::time::sleep;
@@ -124,7 +126,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
         // Say goodbye, then keep receiving in the background: the phone may
         // send its linking information a while after the response.
-        channel.linger().await;
+        channel.close(CableClose::Linger).await;
     }
 
     println!("Waiting for 5 seconds for a linking update...");
@@ -151,7 +153,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         let mut channel = known_device.channel(settings()).await.unwrap();
         println!("Channel established {:?}", channel);
         run_get_assertion(&mut channel, &request_origin, &psl).await?;
-        channel.close().await;
+        channel.close(CableClose::Immediate).await;
     } else {
         println!("No known devices (peer did not offer linking). Falling back to QR.");
         let mut device: CableQrCodeDevice = CableQrCodeDevice::new_persistent(
@@ -170,7 +172,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         println!("Channel established {:?}", channel);
         run_get_assertion(&mut channel, &request_origin, &psl).await?;
         // Nothing follows that could use a linking update, so just close.
-        channel.close().await;
+        channel.close(CableClose::Immediate).await;
     }
 
     // Signal any lingering connection to stop before the runtime goes away.

@@ -3,10 +3,10 @@
 //! MakeCredential only.
 use std::error::Error;
 
-use libwebauthn::transport::cable::is_available;
 use libwebauthn::transport::cable::qr_code_device::{
     CableQrCodeDevice, CableTransports, QrCodeOperationHint,
 };
+use libwebauthn::transport::cable::{is_available, CableClose};
 use qrcode::render::unicode;
 use qrcode::QrCode;
 
@@ -97,6 +97,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     println!("WebAuthn MakeCredential response (JSON):\n{response_json}");
 
     // A transient QR code never lingers, so this is a plain graceful close.
-    channel.close().await;
+    channel.close(CableClose::Immediate).await;
     Ok(())
 }

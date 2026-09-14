@@ -32,9 +32,9 @@ pub(crate) enum Teardown {
 /// After a QR-initiated ceremony the authenticator may send its linking
 /// information a while after the CTAP response. Capturing it needs the
 /// connection to stay open after the caller is done with the channel, which
-/// only happens when the caller calls
-/// [`CableChannel::linger`](super::channel::CableChannel::linger) once the
-/// ceremony has completed. Closing or dropping the channel captures nothing.
+/// only happens when the caller closes the channel with
+/// [`CableClose::Linger`](super::channel::CableClose::Linger) once the
+/// ceremony has completed. An immediate close or a drop captures nothing.
 ///
 /// Carrying a config also makes opening a new hybrid channel evict any
 /// connection still lingering in the same [`CableLingerRegistry`].
